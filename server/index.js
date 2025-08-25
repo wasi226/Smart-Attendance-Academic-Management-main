@@ -5,6 +5,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const path = require('path');
+const nodemailer = require('nodemailer');
+const twilio = require('twilio');
 require('dotenv').config();
 
 const app = express();
@@ -84,6 +86,29 @@ const correctionRequestSchema = new mongoose.Schema({
 
 const CorrectionRequest = mongoose.model('CorrectionRequest', correctionRequestSchema);
 
+// Notification Schema
+const notificationSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  title: { type: String, required: true },
+  message: { type: String, required: true },
+  type: { type: String, enum: ['attendance', 'assignment', 'correction', 'general'], required: true },
+  read: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Notification = mongoose.model('Notification', notificationSchema);
+
+// Class Schema
+const classSchema = new mongoose.Schema({
+  name: { type: String, required: true, unique: true },
+  subjects: [{ type: String }],
+  teacherId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  students: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  createdAt: { type: Date, default: Date.now }
+});
+
+const Class = mongoose.model('Class', classSchema);
+
 // Multer configuration for file uploads
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -95,6 +120,69 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage });
+
+// Initialize notification services
+const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN 
+  ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN) 
+  : null;
+
+const emailTransporter = nodemailer.createTransporter({
+  host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+  port: process.env.EMAIL_PORT || 587,
+  secure: false,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
+// Notification helper functions
+const createNotification = async (userId, title, message, type) => {
+  try {
+    const notification = new Notification({
+      userId,
+      title,
+      message,
+      type
+    });
+    await notification.save();
+    return notification;
+  } catch (error) {
+    console.error('Error creating notification:', error);
+    return null;
+  }
+};
+
+const sendSMS = async (phoneNumber, message) => {
+  if (!twilioClient) return false;
+  try {
+    await twilioClient.messages.create({
+      body: message,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: phoneNumber
+    });
+    return true;
+  } catch (error) {
+    console.error('SMS sending failed:', error);
+    return false;
+  }
+};
+
+const sendEmail = async (email, subject, message) => {
+  if (!process.env.EMAIL_USER) return false;
+  try {
+    await emailTransporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject,
+      html: message
+    });
+    return true;
+  } catch (error) {
+    console.error('Email sending failed:', error);
+    return false;
+  }
+};
 
 // Auth middleware
 const authenticateToken = (req, res, next) => {
@@ -320,12 +408,266 @@ app.get('/api/users', authenticateToken, async (req, res) => {
   }
 });
 
+// Notification Routes
+app.get('/api/notifications/:userId', authenticateToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const notifications = await Notification.find({ userId })
+      .sort({ createdAt: -1 })
+      .limit(50);
+    res.json(notifications);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.put('/api/notifications/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await Notification.findByIdAndUpdate(id, { read: true });
+    res.json({ message: 'Notification marked as read' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Face Recognition Attendance Route
+app.post('/api/attendance/face-recognition', authenticateToken, async (req, res) => {
+  try {
+    const { studentId, confidence, subject, class: className } = req.body;
+    
+    // Check if attendance already exists for today
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    const existingAttendance = await Attendance.findOne({
+      studentId,
+      subject,
+      class: className,
+      date: { $gte: today, $lt: tomorrow }
+    });
+    
+    if (existingAttendance) {
+      return res.status(400).json({ message: 'Attendance already recorded for today' });
+    }
+    
+    const attendance = new Attendance({
+      studentId,
+      teacherId: req.user.userId,
+      subject,
+      class: className,
+      date: new Date(),
+      status: confidence > 0.8 ? 'present' : 'late',
+      method: 'face_recognition',
+      confidence
+    });
+    
+    await attendance.save();
+    
+    // Create notification
+    await createNotification(
+      studentId,
+      'Attendance Recorded',
+      `Your attendance has been recorded for ${subject} via face recognition.`,
+      'attendance'
+    );
+    
+    res.json({ message: 'Attendance recorded successfully', attendance });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// QR Code Attendance Route
+app.post('/api/attendance/qr-code', authenticateToken, async (req, res) => {
+  try {
+    const { qrData, studentId } = req.body;
+    
+    // Verify QR code data
+    const qrInfo = JSON.parse(qrData);
+    const { subject, class: className, timestamp } = qrInfo;
+    
+    // Check if QR code is still valid (within 5 minutes)
+    const qrTime = new Date(timestamp);
+    const now = new Date();
+    const timeDiff = (now - qrTime) / (1000 * 60);
+    
+    if (timeDiff > 5) {
+      return res.status(400).json({ message: 'QR code has expired' });
+    }
+    
+    // Check if attendance already exists for today
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    const existingAttendance = await Attendance.findOne({
+      studentId,
+      subject,
+      class: className,
+      date: { $gte: today, $lt: tomorrow }
+    });
+    
+    if (existingAttendance) {
+      return res.status(400).json({ message: 'Attendance already recorded for today' });
+    }
+    
+    const attendance = new Attendance({
+      studentId,
+      teacherId: req.user.userId,
+      subject,
+      class: className,
+      date: new Date(),
+      status: 'present',
+      method: 'qr_code'
+    });
+    
+    await attendance.save();
+    
+    // Create notification
+    await createNotification(
+      studentId,
+      'Attendance Recorded',
+      `Your attendance has been recorded for ${subject} via QR code.`,
+      'attendance'
+    );
+    
+    res.json({ message: 'Attendance recorded successfully', attendance });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Generate QR Code for Attendance
+app.post('/api/qr-code/generate', authenticateToken, async (req, res) => {
+  try {
+    const { subject, class: className } = req.body;
+    
+    const qrData = {
+      subject,
+      class: className,
+      teacherId: req.user.userId,
+      timestamp: new Date().toISOString()
+    };
+    
+    res.json({ qrData: JSON.stringify(qrData) });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Admin Routes for Correction Requests
+app.get('/api/admin/correction-requests', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    
+    const requests = await CorrectionRequest.find()
+      .populate('studentId', 'name rollNo')
+      .populate('attendanceId')
+      .sort({ createdAt: -1 });
+    
+    res.json(requests);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+app.put('/api/admin/correction-requests/:id', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    
+    const { id } = req.params;
+    const { status, adminNote } = req.body;
+    
+    const request = await CorrectionRequest.findByIdAndUpdate(
+      id,
+      { status, adminNote, responseDate: new Date() },
+      { new: true }
+    ).populate('studentId', 'name email');
+    
+    // Create notification for student
+    await createNotification(
+      request.studentId._id,
+      'Correction Request Update',
+      `Your correction request has been ${status}. ${adminNote || ''}`,
+      'correction'
+    );
+    
+    res.json(request);
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Analytics Routes
+app.get('/api/analytics/attendance/:classId', authenticateToken, async (req, res) => {
+  try {
+    const { classId } = req.params;
+    const { startDate, endDate } = req.query;
+    
+    const filter = { class: classId };
+    if (startDate && endDate) {
+      filter.date = {
+        $gte: new Date(startDate),
+        $lte: new Date(endDate)
+      };
+    }
+    
+    const attendanceData = await Attendance.aggregate([
+      { $match: filter },
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+    
+    const dailyAttendance = await Attendance.aggregate([
+      { $match: filter },
+      {
+        $group: {
+          _id: {
+            date: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
+            status: '$status'
+          },
+          count: { $sum: 1 }
+        }
+      },
+      { $sort: { '_id.date': 1 } }
+    ]);
+    
+    res.json({ attendanceData, dailyAttendance });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // Create uploads directory if it doesn't exist
 const fs = require('fs');
 if (!fs.existsSync('uploads')) {
   fs.mkdirSync('uploads');
 }
 
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Error:', error);
+  res.status(500).json({ message: 'Internal server error' });
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({ message: 'Route not found' });
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`MongoDB URI: ${process.env.MONGODB_URI || 'mongodb://localhost:27017/smart-attendance'}`);
 });
